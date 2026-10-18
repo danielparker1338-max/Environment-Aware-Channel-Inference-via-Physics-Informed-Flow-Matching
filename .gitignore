@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+outputs/
+outputs_*/
+*.pth
+*.pt
+*.npz
+*.mat
+*.zip
+data/
+datasets/
