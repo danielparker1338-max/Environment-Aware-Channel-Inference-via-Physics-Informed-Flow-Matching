@@ -8,7 +8,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 from PIL import Image
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset, Subset, default_collate
 
 try:
     import yaml
@@ -19,7 +19,7 @@ except ImportError as exc:  # pragma: no cover - exercised only in missing deps 
     ) from exc
 
 
-DEFAULT_ROOT = Path("/home/largeDisk/guangming/Latent-Diffusion-Channel/Multimodal-Wireless/")
+DEFAULT_ROOT = Path("/mnt/d/Channel Inference Project")
 DEFAULT_SENSOR_SCENARIO = "Town03_Tjunction_wiz_slope_seed42"
 DEFAULT_CHANNEL_SCENARIO = "Town03_Tjunction"
 DEFAULT_CHANNEL_CONFIG = "Nt_1_64_Nr_1_16_fc_28GHz"
@@ -119,6 +119,67 @@ def cir_to_csi_steering(npz_data: Dict[str, np.ndarray], nr: int, nt: int) -> np
         a_rx = np.exp(1j * 2 * np.pi * d * rx_index * np.sin(phi_r[path_index]))
         channel += alpha[path_index] * np.outer(a_rx, np.conj(a_tx))
     return channel.astype(np.complex64)
+
+
+# -----------------------------------------------------------------------------
+# PHYSICS PILOT ADDITION: build one steering atom for each simulated path.
+# The saved path-angle metadata is used with the antenna array convention that
+# was empirically matched to the per-path matrices in this dataset. This is a
+# prototype based on simulator angles; it does not mean the sensing model knows
+# these path angles at inference time. Atoms are optionally transformed to the
+# same spatial/angular channel domain as the model target.
+# -----------------------------------------------------------------------------
+def path_steering_atoms(npz_data: Dict[str, np.ndarray], channel_domain: str = "angular") -> np.ndarray:
+    """Build per-path steering atoms using the angle convention empirically matched to this dataset."""
+    path_matrix = np.squeeze(npz_data["a"])
+    if path_matrix.ndim != 3:
+        raise ValueError(f"Expected squeezed 'a' to have shape [Nr, Nt, L], got {path_matrix.shape}.")
+    nr, nt, path_count = path_matrix.shape
+    theta_t = np.asarray(npz_data["theta_t"], dtype=np.float32).reshape(-1)
+    phi_t = np.asarray(npz_data["phi_t"], dtype=np.float32).reshape(-1)
+    theta_r = np.asarray(npz_data["theta_r"], dtype=np.float32).reshape(-1)
+    phi_r = np.asarray(npz_data["phi_r"], dtype=np.float32).reshape(-1)
+    if min(theta_t.size, phi_t.size, theta_r.size, phi_r.size) != path_count:
+        raise ValueError("Per-path angle arrays do not match the path count in 'a'.")
+
+    rx_index = np.arange(nr, dtype=np.float32)
+    tx_index = np.arange(nt, dtype=np.float32)
+    spacing_wavelengths = 0.5
+    atoms = []
+    for path_index in range(path_count):
+        # Empirically matched to the saved per-path matrices: theta is zenith,
+        # phi is azimuth, and the array axis is the global/local y direction.
+        u_r = np.sin(theta_r[path_index]) * np.sin(phi_r[path_index])
+        u_t = np.sin(theta_t[path_index]) * np.sin(phi_t[path_index])
+        a_r = np.exp(1j * 2 * np.pi * spacing_wavelengths * rx_index * u_r)
+        a_t = np.exp(-1j * 2 * np.pi * spacing_wavelengths * tx_index * u_t)
+        atom = np.outer(a_r, np.conj(a_t))
+        if channel_domain == "angular":
+            atom = dft_matrix(nr).conj().T @ atom @ dft_matrix(nt)
+        elif channel_domain != "spatial":
+            raise ValueError(f"Unsupported channel domain: {channel_domain}")
+        atoms.append(atom.astype(np.complex64))
+    return np.stack(atoms, axis=0)
+
+
+@lru_cache(maxsize=8192)
+def cached_path_steering_atoms(path_text: str, channel_domain: str) -> np.ndarray:
+    with np.load(path_text, allow_pickle=False) as npz:
+        return path_steering_atoms(npz, channel_domain=channel_domain)
+
+
+def collate_with_steering(batch):
+    """Pad variable path counts within a batch so DataLoader can stack steering atoms."""
+    max_paths = max(item["steering_atoms"].shape[0] for item in batch)
+    for item in batch:
+        atoms = item["steering_atoms"]
+        count = atoms.shape[0]
+        item["steering_count"] = torch.tensor(count, dtype=torch.long)
+        if count < max_paths:
+            pad = torch.zeros((max_paths - count, *atoms.shape[1:]), dtype=atoms.dtype)
+            item["steering_atoms"] = torch.cat((atoms, pad), dim=0)
+    return default_collate(batch)
+# -------------------------- END PHYSICS PILOT ADDITION -----------------------
 
 
 def cir_file_to_csi(
@@ -256,6 +317,8 @@ class MMVTjunctionDataset(Dataset):
         target_mode: str = "complex",
         max_samples: int = 0,
         random_lidar: bool = True,
+        # Physics pilot option: load path steering atoms only when requested.
+        include_steering_atoms: bool = False,
     ) -> None:
         self.root = Path(root)
         self.weather = weather
@@ -278,22 +341,13 @@ class MMVTjunctionDataset(Dataset):
         self.target_mode = target_mode
         self.target_channels = 2 if target_mode == "complex" else 1
         self.random_lidar = random_lidar
+        self.include_steering_atoms = include_steering_atoms
         self.link_geometry_dim = 9
 
-        self.sensor_root = (
-            self.root
-            / weather
-            / "Sensor Data"
-            / town
-            / sensor_scenario
-            / sensor_scenario
-        )
+        self.sensor_root = self.root / sensor_scenario
+
         self.channel_root = (
             self.root
-            / weather
-            / "Channel Data"
-            / "V2I"
-            / channel_config
             / town
             / town
             / channel_scenario
@@ -498,6 +552,13 @@ class MMVTjunctionDataset(Dataset):
             "cav_index": torch.tensor(self.cavs.index(record.cav), dtype=torch.long),
             "index": torch.tensor(index, dtype=torch.long),
         }
+        # Physics pilot addition: attach simulator-angle steering atoms to each
+        # item. The default dataset path stays unchanged when this flag is false.
+        if self.include_steering_atoms:
+            if self.target_mode != "complex":
+                raise ValueError("Steering-subspace physics requires complex channel targets.")
+            atoms = cached_path_steering_atoms(str(record.channel_path), self.channel_domain)
+            item["steering_atoms"] = torch.from_numpy(atoms)
         if self.use_dual_context:
             rsu_points = points
             cav_points_raw = cached_ascii_pcd_xyz(str(record.cav_point_path))

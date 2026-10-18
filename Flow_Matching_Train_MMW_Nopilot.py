@@ -20,10 +20,26 @@ from mmw_dataset import (
     DEFAULT_ROOT,
     DEFAULT_SENSOR_SCENARIO,
     MMVTjunctionDataset,
+    collate_with_steering,
     parse_csv_names,
     split_dataset,
     write_json,
 )
+# -----------------------------------------------------------------------------
+# PHYSICS PILOT ADDITION: the residual is kept in a helper module, while ConFIG
+# is an optional dependency from the separate PBFM reference implementation.
+# The baseline can still import/run when that package is absent; requesting the
+# physics pilot will produce a clear dependency error.
+# -----------------------------------------------------------------------------
+from wireless_physics import steering_subspace_outside_fraction
+
+try:
+    from conflictfree.grad_operator import ConFIG_update
+    from conflictfree.utils import apply_gradient_vector, get_gradient_vector
+except ImportError:  # The baseline remains usable without the optional PBFM dependency.
+    ConFIG_update = None
+    apply_gradient_vector = None
+    get_gradient_vector = None
 
 
 def parse_bool(value):
@@ -59,6 +75,13 @@ def build_parser():
     parser.add_argument("--channel_domain", choices=["angular", "spatial"], default="angular")
     parser.add_argument("--csi_method", choices=["sum_paths", "steering"], default="sum_paths")
     parser.add_argument("--normalize_channel", type=parse_bool, default=True)
+    # The physics residual operates on complex channels, so expose the same
+    # target representation option as inference and validate it when enabled.
+    parser.add_argument(
+        "--target_mode",
+        choices=["complex", "magnitude", "power"],
+        default="complex",
+    )
     parser.add_argument(
         "--use_link_geometry",
         type=parse_bool,
@@ -121,6 +144,28 @@ def build_parser():
         help="Optional direct MSE weight between VE mean mu and the true CSI. Keep 0.0 for the clean no-pilot baseline.",
     )
     parser.add_argument("--weight_decay", type=float, default=1e-4)
+    # -------------------------------------------------------------------------
+    # Optional PBFM-inspired pilot controls. Physics training is opt-in so a
+    # normal baseline run retains its previous objective and behaviour.
+    parser.add_argument(
+        "--physics_loss",
+        type=parse_bool,
+        default=False,
+        help="Enable simulator-angle steering-subspace loss with PBFM-style ConFIG updates.",
+    )
+    parser.add_argument(
+        "--physics_unroll_max_steps",
+        type=int,
+        default=4,
+        help="Maximum Euler steps used to unroll the training-time physics estimate.",
+    )
+    parser.add_argument(
+        "--flow_checkpoint",
+        type=str,
+        default="",
+        help="Optional flow checkpoint to fine-tune (defaults to outputs/flow_matching_mmw_best.pth for physics runs).",
+    )
+    # ------------------------- END PHYSICS CLI OPTIONS -----------------------
     parser.add_argument(
         "--early_stop_patience",
         type=int,
@@ -191,6 +236,7 @@ def apply_vae_config_defaults(args, config, raw_args):
         "channel_domain",
         "csi_method",
         "normalize_channel",
+        "target_mode",
     )
     for key in dataset_keys:
         option = f"--{key}"
@@ -279,13 +325,25 @@ def encode_prior(batch, ve_model, sample=True):
     return mu, mu, logvar
 
 
-def train_one_epoch(dataset_loader, ve_model, flow_model, optimizer, loss_fn, args, device):
+def train_one_epoch(
+    dataset_loader,
+    ve_model,
+    flow_model,
+    optimizer,
+    loss_fn,
+    args,
+    device,
+    epoch,
+    gradient_model=None,
+):
     ve_model.train(args.stage != "fm")
     flow_model.train(args.stage != "vae")
     total_loss = 0.0
     total_flow_loss = 0.0
     total_ve_loss = 0.0
     total_prior_mse = 0.0
+    total_physics_loss = 0.0
+    total_physics_score = 0.0
     total_count = 0
 
     for batch in dataset_loader:
@@ -305,13 +363,42 @@ def train_one_epoch(dataset_loader, ve_model, flow_model, optimizer, loss_fn, ar
         logit_scale = torch.clamp(ve_model.logit_scale.exp(), max=100)
 
         optimizer.zero_grad(set_to_none=True)
+        physics_loss = x_1.new_zeros(())
+        physics_score = x_1.new_zeros(())
         if args.stage == "vae":
             flow_loss = x_1.new_zeros(())
         else:
             t = torch.rand(x_1.size(0), device=device)
             t_view = t[:, None, None, None]
             x_t = t_view * x_1 + (1.0 - t_view) * x_0
-            flow_loss = loss_fn(flow_model(x_t, t), x_1 - x_0)
+            velocity = flow_model(x_t, t)
+            flow_loss = loss_fn(velocity, x_1 - x_0)
+            # -----------------------------------------------------------------
+            # PHYSICS PILOT ADDITION: unroll the learned flow toward t=1, then
+            # evaluate the steering-subspace residual on that approximate final
+            # sample. The step count ramps up during training to limit early cost.
+            # This is the PBFM-style endpoint idea, not merely extra inference
+            # sampling steps. Simulator path angles provide the atoms here.
+            # -----------------------------------------------------------------
+            if args.physics_loss:
+                ramp = max(1, args.epochs // 4)
+                unroll_steps = min(args.physics_unroll_max_steps, 1 + (epoch // ramp))
+                dt = (1.0 - t) / unroll_steps
+                x_phys = x_t + dt[:, None, None, None] * velocity
+                for step in range(1, unroll_steps):
+                    t_step = t + step * dt
+                    velocity_step = flow_model(x_phys, t_step)
+                    x_phys = x_phys + dt[:, None, None, None] * velocity_step
+                physics_per_sample = steering_subspace_outside_fraction(
+                    x_phys,
+                    batch["steering_atoms"],
+                    batch["steering_count"],
+                )
+                physics_score = physics_per_sample.mean()
+                # PBFM weights the residual by t; ConFIG combines this objective's
+                # gradient with flow matching without a hand-tuned scalar weight.
+                physics_loss = torch.mean(t * physics_per_sample)
+            # ---------------------- END UNROLLED PHYSICS LOSS -----------------
         if args.stage == "vae" and args.ve_loss_weight == 0.0:
             ve_loss = x_1.new_zeros(())
         else:
@@ -322,7 +409,26 @@ def train_one_epoch(dataset_loader, ve_model, flow_model, optimizer, loss_fn, ar
             + args.ve_loss_weight * ve_loss
             + args.prior_mse_weight * prior_mse
         )
-        loss.backward()
+        if args.physics_loss:
+            # Compute both objectives' gradients separately, then use ConFIG to
+            # make one conflict-aware update for the trainable flow model. This is
+            # gradient combination, not a scalar physics-loss weight. The safety
+            # fallback keeps the ordinary objective gradient if physics gradients
+            # become non-finite for a batch.
+            optimizer.zero_grad(set_to_none=True)
+            loss.backward(retain_graph=True)
+            gradients = [get_gradient_vector(gradient_model)]
+            optimizer.zero_grad(set_to_none=True)
+            physics_loss.backward()
+            gradients.append(get_gradient_vector(gradient_model))
+            optimizer.zero_grad(set_to_none=True)
+            if not gradients[1].isnan().any() and not gradients[1].isinf().any():
+                apply_gradient_vector(gradient_model, ConFIG_update(gradients))
+            else:
+                print("Non-finite physics gradient; applying flow/objective gradient for this batch.", flush=True)
+                apply_gradient_vector(gradient_model, gradients[0])
+        else:
+            loss.backward()
         optimizer.step()
 
         batch_count = x_1.size(0)
@@ -330,6 +436,8 @@ def train_one_epoch(dataset_loader, ve_model, flow_model, optimizer, loss_fn, ar
         total_flow_loss += flow_loss.item() * batch_count
         total_ve_loss += ve_loss.item() * batch_count
         total_prior_mse += prior_mse.item() * batch_count
+        total_physics_loss += physics_loss.item() * batch_count
+        total_physics_score += physics_score.item() * batch_count
         total_count += batch_count
 
     total_count = max(total_count, 1)
@@ -338,6 +446,8 @@ def train_one_epoch(dataset_loader, ve_model, flow_model, optimizer, loss_fn, ar
         "flow_loss": total_flow_loss / total_count,
         "ve_loss": total_ve_loss / total_count,
         "prior_mse": total_prior_mse / total_count,
+        "physics_loss": total_physics_loss / total_count,
+        "physics_score": total_physics_score / total_count,
     }
 
 
@@ -348,6 +458,29 @@ def main(argv=None):
     set_seed(args.seed)
 
     script_dir = Path(__file__).resolve().parent
+    # -------------------------------------------------------------------------
+    # Physics-pilot guardrails and defaults: keep the pretrained multimodal prior
+    # frozen, require complex channels and ConFIG, and direct outputs to a separate
+    # folder so baseline checkpoints are not overwritten.
+    if args.physics_loss:
+        if args.stage != "fm":
+            raise ValueError("The physics pilot currently requires --stage fm to keep the pretrained multimodal prior frozen.")
+        if args.target_mode != "complex":
+            raise ValueError("The steering-subspace physics pilot requires --target_mode complex.")
+        if args.physics_unroll_max_steps < 1:
+            raise ValueError("--physics_unroll_max_steps must be at least 1.")
+        if not args.vae_checkpoint_dir:
+            args.vae_checkpoint_dir = "outputs"
+        if args.flow_checkpoint == "":
+            args.flow_checkpoint = str(Path("outputs") / "flow_matching_mmw_best.pth")
+        if args.output_dir == Path("outputs"):
+            args.output_dir = Path("outputs_pbfm_pilot")
+        if ConFIG_update is None:
+            raise ImportError(
+                "Physics training requires the optional PBFM dependency 'conflictfree'. "
+                "Install it in the same Python environment as PyTorch."
+            )
+    # ------------------------ END PHYSICS PILOT SETUP ------------------------
     vae_checkpoint_dir = resolve_checkpoint_dir(args.vae_checkpoint_dir, script_dir)
     vae_config = load_config(vae_checkpoint_dir / "config.json") if vae_checkpoint_dir else {}
     args = apply_vae_config_defaults(args, vae_config, raw_args)
@@ -375,6 +508,7 @@ def main(argv=None):
         normalize_channel=args.normalize_channel,
         max_samples=args.max_samples,
         random_lidar=True,
+        include_steering_atoms=args.physics_loss,
     )
     train_set = split_dataset(dataset, 1.0, "all")
 
@@ -384,12 +518,22 @@ def main(argv=None):
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_with_steering if args.physics_loss else None,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     ve_model = VE_MultimodalityMMW(channel_shape=dataset.channel_shape).to(device)
     ve_model.use_link_geometry = bool(args.use_link_geometry)
     flow_model = MiniUnet(base_channels=args.base_channels).to(device)
+
+    flow_checkpoint_path = None
+    if args.flow_checkpoint:
+        flow_checkpoint_path = Path(args.flow_checkpoint)
+        if not flow_checkpoint_path.is_absolute():
+            flow_checkpoint_path = script_dir / flow_checkpoint_path
+        if not flow_checkpoint_path.exists():
+            raise FileNotFoundError(f"Missing flow checkpoint: {flow_checkpoint_path}")
+        flow_model.load_state_dict(torch.load(flow_checkpoint_path, map_location=device))
 
     if args.stage == "fm":
         if vae_checkpoint_dir is None:
@@ -409,6 +553,7 @@ def main(argv=None):
         trainable_parameters.append({"params": flow_model.parameters(), "lr": args.lr})
     optimizer = optim.AdamW(trainable_parameters, weight_decay=args.weight_decay)
     loss_fn = nn.MSELoss()
+    gradient_model = nn.ModuleList([flow_model]) if args.physics_loss else None
 
     config_payload = {
         "args": {key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
@@ -433,6 +578,14 @@ def main(argv=None):
     print(f"Output dir: {output_dir}", flush=True)
     if args.stage == "fm":
         print(f"Frozen VAE checkpoint: {vae_checkpoint_dir / args.vae_checkpoint_name}", flush=True)
+    if flow_checkpoint_path is not None:
+        print(f"Flow initialization checkpoint: {flow_checkpoint_path}", flush=True)
+    if args.physics_loss:
+        print(
+            f"Physics loss: simulator-angle steering subspace; PBFM ConFIG; "
+            f"unroll steps ramp 1 to {args.physics_unroll_max_steps}",
+            flush=True,
+        )
     print(
         f"Link geometry: {'on' if args.use_link_geometry else 'off'} "
         f"(dim {dataset.link_geometry_dim})",
@@ -442,7 +595,17 @@ def main(argv=None):
     best_train_loss = float("inf")
     epochs_without_improvement = 0
     for epoch in range(args.epochs):
-        train_metrics = train_one_epoch(train_loader, ve_model, flow_model, optimizer, loss_fn, args, device)
+        train_metrics = train_one_epoch(
+            train_loader,
+            ve_model,
+            flow_model,
+            optimizer,
+            loss_fn,
+            args,
+            device,
+            epoch,
+            gradient_model=gradient_model,
+        )
 
         if args.stage == "vae":
             log_message = (
@@ -455,7 +618,9 @@ def main(argv=None):
                 f"====> Epoch: {epoch} "
                 f"train_loss: {train_metrics['loss']:.8f} "
                 f"(flow {train_metrics['flow_loss']:.8f}, ve {train_metrics['ve_loss']:.8f}, "
-                f"prior_mse {train_metrics['prior_mse']:.8f})"
+                f"prior_mse {train_metrics['prior_mse']:.8f}, "
+                f"physics {train_metrics['physics_loss']:.8f}, "
+                f"outside {train_metrics['physics_score']:.8f})"
             )
         print(log_message, flush=True)
 

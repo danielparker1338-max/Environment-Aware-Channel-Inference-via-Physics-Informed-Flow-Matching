@@ -16,10 +16,17 @@ from mmw_dataset import (
     DEFAULT_ROOT,
     DEFAULT_SENSOR_SCENARIO,
     MMVTjunctionDataset,
+    collate_with_steering,
     parse_csv_names,
     split_dataset,
     write_json,
 )
+# -----------------------------------------------------------------------------
+# Physics pilot metric helper. It is used only when --physics_metric is enabled;
+# its steering atoms come from simulator path angles, so this is an oracle-angle
+# diagnostic rather than a metric based solely on camera/LiDAR/GPS inputs.
+from wireless_physics import steering_subspace_outside_fraction
+# -------------------------- END PHYSICS METRIC IMPORT ------------------------
 
 
 def parse_bool(value):
@@ -83,6 +90,16 @@ def build_parser():
     parser.add_argument("--base_channels", type=int, default=64)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save", type=str, default="")
+    # -------------------------------------------------------------------------
+    # Optional diagnostic: compare the prediction, dataset target, and prior
+    # against the same simulator-angle steering subspace.
+    parser.add_argument(
+        "--physics_metric",
+        type=parse_bool,
+        default=False,
+        help="Report oracle simulator-angle steering-subspace energy outside the path span.",
+    )
+    # -------------------------- END PHYSICS CLI OPTION -----------------------
     return parser
 
 
@@ -256,6 +273,9 @@ def run_inference(loader, ve_model, flow_model, args, device):
     frames = []
     cav_indices = []
     dataset_indices = []
+    physics_scores = []
+    physics_truth_scores = []
+    physics_prior_scores = []
 
     t_points = build_time_schedule(args.n_steps, args.schedule, args.schedule_power, device)
 
@@ -283,8 +303,23 @@ def run_inference(loader, ve_model, flow_model, args, device):
         frames.append(batch["frame"].detach().cpu())
         cav_indices.append(batch["cav_index"].detach().cpu())
         dataset_indices.append(batch["index"].detach().cpu())
+        if args.physics_metric:
+            # -----------------------------------------------------------------
+            # Score all three using identical path atoms. Truth and prediction
+            # scores help show whether the model moves toward the target's
+            # supported subspace; the prior score is a reference point.
+            atoms = batch["steering_atoms"]
+            counts = batch["steering_count"]
+            physics_scores.append(steering_subspace_outside_fraction(x_t, atoms, counts).detach().cpu())
+            physics_truth_scores.append(
+                steering_subspace_outside_fraction(truth, atoms, counts).detach().cpu()
+            )
+            physics_prior_scores.append(
+                steering_subspace_outside_fraction(prior, atoms, counts).detach().cpu()
+            )
+            # --------------------- END PHYSICS SCORING ------------------------
 
-    return {
+    outputs = {
         "prediction": torch.cat(predictions, dim=0),
         "prior": torch.cat(priors, dim=0),
         "truth": torch.cat(truths, dim=0),
@@ -292,6 +327,17 @@ def run_inference(loader, ve_model, flow_model, args, device):
         "cav_indices": torch.cat(cav_indices, dim=0),
         "dataset_indices": torch.cat(dataset_indices, dim=0),
     }
+    # -------------------------------------------------------------------------
+    # Keep the optional per-sample diagnostic values alongside the channel
+    # outputs so they can be aggregated or plotted without rerunning inference.
+    if physics_scores:
+        # Store per-sample values in the same output bundle as channel estimates;
+        # this makes later aggregation/plotting possible without rerunning inference.
+        outputs["physics_outside_fraction"] = torch.cat(physics_scores, dim=0)
+        outputs["physics_truth_outside_fraction"] = torch.cat(physics_truth_scores, dim=0)
+        outputs["physics_prior_outside_fraction"] = torch.cat(physics_prior_scores, dim=0)
+    # ------------------------ END PHYSICS OUTPUT FIELDS ----------------------
+    return outputs
 
 
 def save_outputs(path, outputs, metadata):
@@ -307,6 +353,10 @@ def save_outputs(path, outputs, metadata):
         "cav_indices": outputs["cav_indices"].numpy(),
         "dataset_indices": outputs["dataset_indices"].numpy(),
     }
+    if "physics_outside_fraction" in outputs:
+        arrays["physics_outside_fraction"] = outputs["physics_outside_fraction"].numpy()
+        arrays["physics_truth_outside_fraction"] = outputs["physics_truth_outside_fraction"].numpy()
+        arrays["physics_prior_outside_fraction"] = outputs["physics_prior_outside_fraction"].numpy()
 
     if path.suffix == ".mat":
         try:
@@ -323,6 +373,8 @@ def save_outputs(path, outputs, metadata):
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    if args.physics_metric and args.target_mode != "complex":
+        raise ValueError("The steering-subspace physics metric requires --target_mode complex.")
     set_seed(args.seed)
 
     script_dir = Path(__file__).resolve().parent
@@ -357,6 +409,7 @@ def main(argv=None):
         target_mode=args.target_mode,
         max_samples=args.max_samples,
         random_lidar=False,
+        include_steering_atoms=args.physics_metric,
     )
 
     split_set = split_dataset(dataset, args.train_ratio, args.split)
@@ -375,6 +428,7 @@ def main(argv=None):
         shuffle=False,
         num_workers=args.num_workers,
         pin_memory=torch.cuda.is_available(),
+        collate_fn=collate_with_steering if args.physics_metric else None,
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -450,6 +504,22 @@ def main(argv=None):
         print(f"Final phase-aligned NMSE (aggregate): {final_phase_aligned_nmse.item():.4f} dB")
     print(f"Mean per-sample NMSE: {final_per_sample.mean().item():.4f} dB")
     print(f"Median per-sample NMSE: {final_per_sample.median().item():.4f} dB")
+    if "physics_outside_fraction" in outputs:
+        print(
+            "Simulator-angle steering-subspace outside-energy fraction (prediction): "
+            f"mean {outputs['physics_outside_fraction'].mean().item():.6e}, "
+            f"median {outputs['physics_outside_fraction'].median().item():.6e}"
+        )
+        print(
+            "Simulator-angle steering-subspace outside-energy fraction (truth): "
+            f"mean {outputs['physics_truth_outside_fraction'].mean().item():.6e}, "
+            f"median {outputs['physics_truth_outside_fraction'].median().item():.6e}"
+        )
+        print(
+            "Simulator-angle steering-subspace outside-energy fraction (prior): "
+            f"mean {outputs['physics_prior_outside_fraction'].mean().item():.6e}, "
+            f"median {outputs['physics_prior_outside_fraction'].median().item():.6e}"
+        )
 
     cav_names = list(parse_csv_names(args.cavs))
     for cav_index, cav_name in enumerate(cav_names):
